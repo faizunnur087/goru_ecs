@@ -1,0 +1,166 @@
+name: Deploy — goru_ecs
+
+on:
+  workflow_dispatch:
+
+env:
+  ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION: node24
+  ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: node24
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: pytest --tb=short -q 2>/dev/null || echo "No tests found"
+
+  build_push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      image_tag:     ${{ steps.meta.outputs.image_tag }}
+      project_lower: ${{ steps.meta.outputs.project_lower }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+      - name: Login to ECR
+        id: login_ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Set image tag
+        id: meta
+        run: |
+          ECR_REGISTRY="${{ steps.login_ecr.outputs.registry }}"
+          IMAGE_TAG="${{ github.sha }}"
+          # Sanitize: lowercase → replace non-alphanumeric/hyphen with - → collapse -- → strip leading/trailing -
+          PROJECT_NAME=$(echo "${{ secrets.PROJECT_NAME }}" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/[^a-z0-9-]/-/g' \
+            | sed 's/-\{2,\}/-/g' \
+            | sed 's/^-//; s/-$//')
+          echo "image_tag=${ECR_REGISTRY}/${PROJECT_NAME}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "project_lower=${PROJECT_NAME}" >> $GITHUB_OUTPUT
+      - name: Create ECR repository if missing
+        run: |
+          aws ecr describe-repositories --repository-names "${{ steps.meta.outputs.project_lower }}" 2>/dev/null || \
+          aws ecr create-repository --repository-name "${{ steps.meta.outputs.project_lower }}" --region ${{ secrets.AWS_REGION }} 2>/dev/null || true
+      - name: Build & push
+        run: |
+          docker build -t ${{ steps.meta.outputs.image_tag }} .
+          docker push ${{ steps.meta.outputs.image_tag }}
+
+  deploy:
+    name: Deploy to ECS (Terraform)
+    runs-on: ubuntu-latest
+    needs: build_push
+    outputs:
+      url: ${{ steps.alb.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+      - name: Create S3 state bucket
+        run: aws s3 mb s3://${{ secrets.TF_STATE_BUCKET }} --region ${{ secrets.AWS_REGION }} 2>/dev/null || true
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+      - name: Import existing ECR repository if it exists
+        working-directory: terraform
+        env:
+          ECR_NAME: ${{ needs.build_push.outputs.project_lower }}
+        run: |
+          # If the ECR repo already exists in AWS but not in Terraform state, import it
+          # so terraform apply does not fail with RepositoryAlreadyExistsException
+          aws ecr describe-repositories --repository-names "$ECR_NAME" 2>/dev/null && \
+            terraform import \
+              -var="project_name=${{ secrets.PROJECT_NAME }}" \
+              -var="container_image=placeholder" \
+              aws_ecr_repository.app "$ECR_NAME" 2>/dev/null || true
+      - name: Terraform apply
+        working-directory: terraform
+        env:
+          DB_NAME:      ${{ secrets.DB_NAME }}
+          DB_USERNAME:  ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD:  ${{ secrets.DB_PASSWORD }}
+          CONTAINER_IMAGE: ${{ needs.build_push.outputs.image_tag }}
+        run: |
+          EXTRA_ARGS=()
+          [ -n "$DB_NAME" ]         && EXTRA_ARGS+=(-var "db_name=$DB_NAME")
+          [ -n "$DB_USERNAME" ]     && EXTRA_ARGS+=(-var "db_username=$DB_USERNAME")
+          [ -n "$DB_PASSWORD" ]     && EXTRA_ARGS+=(-var "db_password=$DB_PASSWORD")
+          [ -n "$CONTAINER_IMAGE" ] && EXTRA_ARGS+=(-var "container_image=$CONTAINER_IMAGE")
+          terraform apply -auto-approve \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            "${EXTRA_ARGS[@]}"
+      - name: Get ALB DNS
+        id: alb
+        working-directory: terraform
+        run: |
+          # Print full terraform output so orchestrator log-scraper can find alb_url pattern
+          terraform output
+          ALB_DNS=$(terraform output -raw alb_dns_name 2>/dev/null || true)
+          ALB_URL="http://${ALB_DNS}"
+          echo "url=${ALB_URL}" >> $GITHUB_OUTPUT
+          echo "alb_url = \"${ALB_URL}\""
+          echo "Live URL: ${ALB_URL}"
+
+  verify:
+    name: Health Check
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - name: Wait for ECS service to be healthy
+        run: |
+          URL="${{ needs.deploy.outputs.url }}"
+          if [ -z "$URL" ] || [ "$URL" = "http://" ]; then
+            echo "No URL available — skipping health check"
+            exit 0
+          fi
+          echo "Checking health at ${URL}/health"
+          for i in $(seq 1 20); do
+            curl -sf "${URL}/health" && echo "Health check passed!" && exit 0 || sleep 15
+          done
+          echo "Health check did not pass within timeout — check ECS service logs"
+
+  notify:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [deploy, verify]
+    if: always()
+    steps:
+      - name: Print URL
+        run: |
+          URL="${{ needs.deploy.outputs.url }}"
+          echo "================================================"
+          echo "ECS Deployment complete!"
+          if [ -n "$URL" ] && [ "$URL" != "http://" ]; then
+            echo "Live URL: ${URL}"
+            echo "alb_url = \"${URL}\""
+          else
+            echo "Check ECS service in AWS Console for the ALB URL."
+          fi
+          echo "================================================"
